@@ -1,0 +1,11 @@
+PyYAML>=5.4
+gitpython>=3.1
+filelock>=3.0
+bidict>=0.21
+attributee>=0.1.7
+argcomplete>=1.12
+watchgod>=0.7
+rich>=9.11
+filtration>=2.2.0
+requests>=2.28
+six>=1.16

@@ -20,7 +20,8 @@ from rich.table import Table
 from rich.tree import Tree
 
 from msks import logger
-from msks.task import TaskFilter, TaskQueue, TaskStorage, TaskStatus
+from msks.task import TaskFilter, TaskStatus
+from msks.storage import TaskQueue, TaskStorage
 from msks.environment import Entrypoint, Environment
 
 console = Console()
@@ -68,7 +69,7 @@ def process_arguments(raw):
 def resolve_source(source):
     config = get_config()
 
-    return config.sources.get(source, source)
+    return config.aliases.get(source, source)
 
 
 def task_submit(source, entrypoint, arguments, properties=None, tags=None, force=False):

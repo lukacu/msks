@@ -64,8 +64,6 @@ class FileOutput(LogHandler):
     def contents(self):
         return open(self._file, "r").read()
 
-
-
 class PrintOutput(LogHandler):
 
     def __call__(self, line):

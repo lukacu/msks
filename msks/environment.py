@@ -1,10 +1,9 @@
 
 from __future__ import absolute_import
 from enum import Enum
-from genericpath import isdir
+from genericpath import exists
 
 import os
-import sys
 import subprocess
 import logging
 import shutil
@@ -25,18 +24,23 @@ from attributee.io import Serializable
 
 from msks import logger
 from msks import dict_hash
+from msks.config import get_config
 
 ARGUMENT_PARSER = re.compile(r"\{\{(:?[a-zA-Z0-9_]+)\}\}")
 
-_CACHE_ROOT = os.environ.get("MSKS_STORAGE", os.path.join(os.environ["HOME"], ".local", "msks"))
-_CACHE_ENV = os.environ.get("MSKS_SOURCE_CACHE", os.path.join(_CACHE_ROOT, "env"))
-_CACHE_SOURCE = os.environ.get("MSKS_SOURCE_CACHE", os.path.join(_CACHE_ROOT, "sources"))
+CONDA_URL = "https://repo.anaconda.com/miniconda/Miniconda3-py39_4.12.0-Linux-x86_64.sh"
 
-def _lock_env():
-    return filelock.FileLock(os.path.join(_CACHE_ENV, ".lock"))
+def _lock_conda():
+    conda_dir = get_config().conda
+    if not os.path.exists(conda_dir):
+        os.makedirs(conda_dir, exist_ok=True)
+    return filelock.FileLock(os.path.join(conda_dir, ".lock"))
 
-def _lock_source():
-    return filelock.FileLock(os.path.join(_CACHE_SOURCE, ".lock"))
+def _lock_sources():
+    sources_dir = get_config().sources
+    if not os.path.exists(sources_dir):
+        os.makedirs(sources_dir, exist_ok=True)
+    return filelock.FileLock(os.path.join(sources_dir, ".lock"))
 
 def _order_multi(item):
 
@@ -155,42 +159,45 @@ class Environment(object):
 
     @staticmethod
     def list_environments():
-        with _lock_env():
-            return [x for x in os.listdir(_CACHE_ENV) if os.path.isdir(os.path.join(_CACHE_ENV, x, "condabin"))]
+        with _lock_conda():
+            conda_dir = get_config().conda
+            return [x for x in os.listdir(conda_dir) if os.path.isdir(os.path.join(conda_dir, x, "condabin"))]
 
     @staticmethod
     def list_sources():
-        with _lock_source():
-            return [x for x in os.listdir(_CACHE_SOURCE) if os.path.isdir(os.path.join(_CACHE_SOURCE, x, ".git"))]
+        with _lock_sources():
+            sources_dir = get_config().sources
+            return [x for x in os.listdir(sources_dir) if os.path.isdir(os.path.join(sources_dir, x, ".git"))]
 
     @staticmethod
     def remove_environments(*ids):
-        with _lock_env():
-
+        with _lock_conda():
+            conda_dir = get_config().conda
             for id in ids:
 
-                if not os.path.isdir(os.path.join(_CACHE_ENV, id, "condabin")):
+                if not os.path.isdir(os.path.join(conda_dir, id, "condabin")):
                     continue
 
                 logger.debug("Removing environment %s", id)
-                shutil.rmtree(os.path.join(_CACHE_ENV, id), ignore_errors=True)
+                shutil.rmtree(os.path.join(conda_dir, id), ignore_errors=True)
 
     @staticmethod
     def remove_sources(*ids):
-        with _lock_source():
-
+        with _lock_sources():
+            sources_dir = get_config().sources
             for id in ids:
 
-                if not os.path.isdir(os.path.join(_CACHE_SOURCE, id, ".git")):
+                if not os.path.isdir(os.path.join(sources_dir, id, ".git")):
                     continue
 
                 logger.debug("Removing source %s", id)
-                shutil.rmtree(os.path.join(_CACHE_SOURCE, id), ignore_errors=True)
+                shutil.rmtree(os.path.join(sources_dir, id), ignore_errors=True)
 
     @staticmethod
     def list_sources():
-        with _lock_source():
-            return [x for x in os.listdir(_CACHE_SOURCE) if os.path.isdir(os.path.join(_CACHE_SOURCE, x, ".git"))]
+        with _lock_sources():
+            sources_dir = get_config().sources
+            return [x for x in os.listdir(sources_dir) if os.path.isdir(os.path.join(sources_dir, x, ".git"))]
 
 
     @property
@@ -247,28 +254,61 @@ class Environment(object):
         pip_file = _find_file(source_dir, ["requirements.txt", "pip.txt"])
         shell_file = _find_file(source_dir, ["environment.sh", "env.sh", "install.sh", "setup.sh"])
 
-        return self._setup_conda(self.environment_identifier, conda_file, pip_file, shell_file)
+        return self._setup_conda_environment(self.environment_identifier, conda_file, pip_file, shell_file)
 
-    def _setup_conda(self, id, conda_file, pip_file=None, shell_file=None):
+    def _setup_conda(self):
+
+        from msks.remote import download_file
 
         debug = logger.isEnabledFor(logging.DEBUG)
         output = PrintOutput() if debug else None
 
-        os.makedirs(_CACHE_ENV, exist_ok=True)
+        with _lock_conda():
+            conda_dir = get_config().conda
 
-        with _lock_env():
+            if os.path.isfile(os.path.join(conda_dir, "condabin", "conda")):
+                logger.debug("Conda installation found")
+                return True
+
+            logger.info("Downloading and installing Conda distributuion, this may take a while")
+
+            installer_file = download_file(CONDA_URL)
+
+            logger.debug("Download complete")
+
+            success = self._run_command("sh", installer_file, "-b", '-f', '-p', conda_dir, output=output)
+
+            if success:
+                logger.debug("Installation complete")
+
+            os.unlink(installer_file)
+
+            return success
+
+    def _setup_conda_environment(self, id, conda_file, pip_file=None, shell_file=None):
+
+        debug = logger.isEnabledFor(logging.DEBUG)
+        output = PrintOutput() if debug else None
+
+        if not self._setup_conda():
+            return False
+
+        with _lock_conda():
             
-            if os.path.isfile(os.path.join(_CACHE_ENV, id, "condabin", "conda")):
+            conda_dir = get_config().conda
+
+            if os.path.isfile(os.path.join(conda_dir, id, "condabin", "conda")):
                 logger.debug("Conda environment %s already exists", id)
                 return True
 
+            logger.info("Creating a new Conda environment %s", id)
 
-            logger.info("Creating new Conda environment %s", id)
+            conda_cli = os.path.join(conda_dir, "condabin", "conda")
 
-            success = self._run_command("conda", "env", "create", "--json", '-p', os.path.join(_CACHE_ENV, id), "--file", conda_file, output=output)
+            success = self._run_command(conda_cli, "env", "create", "--json", '-p', os.path.join(conda_dir, id), "--file", conda_file, output=output)
 
             if success and pip_file is not None:
-                success = self._run_command("conda", "install", "--json", '-p', os.path.join(_CACHE_ENV, id), "pip", "git", output=output)
+                success = self._run_command(conda_cli, "install", "--json", '-p', os.path.join(conda_dir, id), "pip", "git", output=output)
                 success = success and self.run("pip", "install", "-r", pip_file, output=output)
 
             if success and shell_file is not None:
@@ -278,18 +318,17 @@ class Environment(object):
         if success:
             return True
         else:
-            shutil.rmtree(os.path.join(_CACHE_ENV, id))
+            shutil.rmtree(os.path.join(conda_dir, id))
             return False
 
     def _setup_source(self, repository, commit):
+        with _lock_sources():
 
-        os.makedirs(_CACHE_SOURCE, exist_ok=True)
+            sources_dir = get_config().sources
 
-        source_hash = dict_hash({"repository" : repository, "commit" : commit})
+            source_hash = dict_hash({"repository" : repository, "commit" : commit})
 
-        destination = os.path.join(_CACHE_SOURCE, source_hash)
-
-        with _lock_source():
+            destination = os.path.join(sources_dir, source_hash)
 
             try:
 
@@ -350,8 +389,10 @@ class Environment(object):
         envvars = dict()
         envvars["PATH"] = os.environ.get("PATH", "")
 
+        conda_dir = get_config().conda
+
         if self._conda_env is not None:
-            conda_prefix = _CACHE_ENV
+            conda_prefix = conda_dir
             if "CONDA_PREFIX" in os.environ:
                 prefix = os.environ["CONDA_PREFIX"]
                 envvars["PATH"] = os.path.pathsep.join([x for x in envvars["PATH"].split(os.path.pathsep) if not x.startswith(prefix)])
