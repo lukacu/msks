@@ -347,7 +347,7 @@ class TaskFilter(Callable):
             return self[name] is not None
 
     def __init__(self, condition):
-        from filtration import Expression
+        from .filters import Expression
         self._expression = Expression.parseString(condition)
 
     def __call__(self, task: Task):

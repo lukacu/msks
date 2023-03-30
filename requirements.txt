@@ -6,6 +6,6 @@ attributee>=0.1.7
 argcomplete>=1.12
 watchgod>=0.7
 rich>=9.11
-filtration>=2.2.0
 requests>=2.28
 six>=1.16
+pyparsing>=3.0.0
