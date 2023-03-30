@@ -18,10 +18,209 @@ from msks.task import Task, TaskWatcher, TaskStatus, _META_DIRECTORY
 
 _REFERENCE_PARSER = re.compile(r"@(:?[a-zA-Z0-9_]+):(:?[^ ]+)")
 
-class TaskStorage(object):
+class TaskStore(object):
 
-    def __init__(self):
-        self._root = get_config().tasks
+    def filepath(self, file: str):
+        pass
+
+    def append_log(self, lines):
+        pass
+
+    def log(self):
+        pass
+
+    def set(self, key, value):
+        pass
+
+    def get(self, key):
+        pass
+
+    def filepath(self, file: str):
+        pass
+
+    def read(self, file, binary=False):
+        pass
+
+    def write(self, file, binary=False):
+        pass
+
+    def lock(self):
+        pass
+
+    def unlock(self):
+        pass
+
+    def clear(self):
+        pass
+
+    def __enter__(self):
+        self.lock()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.unlock()
+
+class TasksStore(object):
+
+    def update(self, identifier = None):
+        pass
+
+    def wait(self, tasks=None, timeout=-1):
+        pass
+
+    def tag(self, task, tag):
+        pass
+
+    def tags(self, task):
+        pass
+
+    def remove(self, task):
+        pass
+        
+    def cleanup(self, failed=True, completed=False):
+        pass
+
+    def query(self, filter: Optional[Callable] = None, order: Optional[Callable] = None, reverse: bool = False) -> List[Task]:
+        pass
+
+    def dependencies(self, task, wait=False):
+        pass
+    
+    def get(self, identifier) -> Task:
+        pass
+
+    def search(self, prefix) -> Task:
+        pass
+    
+    def restore(self):
+        pass
+    
+    def export(self, source, entrypoint, arguments):
+        pass
+
+    def create(self, source, entrypoint, arguments, exist_ok=True) -> Task:
+        pass
+
+class FileTaskStore(TaskStore):
+
+    def __init__(self, root):
+        self._root = root
+        os.makedirs(os.path.join(self._root, _META_DIRECTORY), exist_ok=True)
+        self._lock = filelock.FileLock(os.path.join(self._root, _META_DIRECTORY, ".lock"))
+        self._meta = None
+        self._timestamp = None
+        self._log = None
+
+    def filepath(self, file: str):
+        if os.path.isabs(file):
+            raise IOError("Only relative paths allowed")
+
+        return os.path.join(self._root, file)
+
+    def append_log(self, line):
+        if self._log is None:
+            self._log = open(os.path.join(self._root, _META_DIRECTORY, "output.txt"), "w")
+
+        if line is not None:
+            self._log.write(line)
+            self._log.flush()
+        else:
+            self._log.close()
+            self._log = None
+
+    def log(self):
+        logfile = os.path.join(self._root, _META_DIRECTORY, "output.txt")
+        if os.path.exists(logfile):
+            return open(logfile).read()
+        return ""
+
+    def set(self, key: str, value):
+        if key.startswith("#"):
+            key = key[1:]
+            self._update()
+            if key in self._meta:
+                if isinstance(value, (float, int, str)) and self._meta[key] == value:
+                    return
+            self._meta[key] = value
+            self._push()
+        else:
+            if isinstance(value, (bytes, bytearray)):
+                datafile = os.path.join(self._root, _META_DIRECTORY, "%s.blob" % key)
+                with open(datafile, "wb") as handle:
+                    handle.write(value)
+            else:
+                datafile = os.path.join(self._root, _META_DIRECTORY, "%s.json" % key)
+                with open(datafile, "w") as handle:
+                    json.dump(value, handle)
+
+    def get(self, key):
+        if key.startswith("#"):
+            key = key[1:]
+            self._update()
+            return self._meta.get(key, None)
+        else:
+            datafile = os.path.join(self._root, _META_DIRECTORY, "%s.blob" % key)
+            if os.path.isfile(datafile):
+                with open(datafile, "rb") as handle:
+                    return handle.read()
+            datafile = os.path.join(self._root, _META_DIRECTORY, "%s.json" % key)
+            if os.path.isfile(datafile):
+                with open(datafile, "r") as handle:
+                    return json.load(handle)
+            return None
+
+    def _update(self):
+        with self._lock:
+            metafile = os.path.join(self._root, _META_DIRECTORY, "meta.json")
+            if self._timestamp != os.stat(metafile).st_ctime or self._meta is None:
+                with open(metafile, "r") as handle:
+                    self._meta = json.load(handle)
+                self._timestamp = os.stat(metafile).st_ctime
+
+    def filepath(self, file: str):
+        return os.path.join(self._root, file)
+
+    def clear(self):
+        with self._lock:
+            for entry in os.scandir(self._root):
+                if entry.name == _META_DIRECTORY:
+                    continue
+                if entry.is_dir:
+                    shutil.rmtree(entry.path, ignore_errors=True)
+                else:
+                    os.unlink(entry.path)
+
+    def read(self, file, binary=False):
+        full = self.filepath(file)
+        if binary:
+            return open(full, mode="rb")
+        else:
+            return open(full, mode="r", newline="") 
+
+    def write(self, file, binary=False):
+        full = self.filepath(file)
+        if binary:
+            return open(full, mode="wb")
+        else:
+            return open(full, mode="w", newline="") 
+
+    def _push(self):
+        with self._lock:
+            metafile = os.path.join(self._root, _META_DIRECTORY, "meta.json")
+            self._meta["updated"] = str(datetime.utcnow())
+            with open(metafile, "w") as handle:
+                json.dump(self._meta, handle)
+            self._timestamp = os.stat(metafile).st_ctime
+
+    def lock(self):
+        self._lock.acquire()
+
+    def unlock(self):
+        self._lock.release()
+
+class LocalTasksStore(TasksStore):
+
+    def __init__(self, root):
+        self._root = root
         self._condition = Condition()
         self._filelock = filelock.FileLock(os.path.join(self._root, ".lock"))
         os.makedirs(self._root, exist_ok=True)
@@ -77,7 +276,8 @@ class TaskStorage(object):
 
     def _load(self, identifier):
 
-        task = Task(self, identifier)
+        root = os.path.join(self._root, identifier)
+        task = Task(FileTaskStore(root), identifier)
 
         self._tasks[identifier] = task
         return self._tasks[identifier]
@@ -116,7 +316,6 @@ class TaskStorage(object):
                 shutil.rmtree(os.path.join(self._root, task), ignore_errors=True)
                 del self._tasks[task]
                 
-        
     def cleanup(self, failed=True, completed=False):
         with self._condition:
             with self._filelock:
@@ -171,9 +370,6 @@ class TaskStorage(object):
 
         with self._condition:
 
-
-
-            
             with self._filelock:
 
                 arguments, dependencies = self._normalize_arguments(arguments)
@@ -288,9 +484,22 @@ class TaskStorage(object):
     def __exit__(self, exc_type, exc_value, traceback):
         self._filelock.release()
 
+
+_store = None
+
+def get_tasks_store() -> TasksStore:
+    global _store
+    if _store is None:
+        scheme = get_config().store.scheme
+        if scheme == "file":
+            _store = LocalTasksStore(get_config().store.path)
+        else:
+            raise RuntimeError("Unrecognized store type")
+    return _store
+
 class TaskQueue(object):
 
-    def __init__(self, storage: TaskStorage):
+    def __init__(self, storage: TasksStore):
         self._storage = storage
         self._condition = Condition()
 

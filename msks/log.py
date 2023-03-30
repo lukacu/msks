@@ -2,36 +2,16 @@ import sys
 import os
 import json
 
-from attributee import Attribute, Attributee
+from attributee import Attribute, Attributee, Pattern
 from attributee.primitives import String, to_string
 
 from msks import logger
-
-from re import Pattern, compile
-
-class Pattern(Attribute):
-
-    def coerce(self, value, ctx):
-        if value is None:
-            return None
-        if isinstance(value, Pattern):
-            return value
-        value = to_string(value)
-        return compile(value)
-
-    def dump(self, value):
-        if value is None:
-            return None
-
-        return value.pattern
-
 
 class LogHandler(object):
 
     def __call__(self, line):
         pass
-
-
+    
 class Multiplexer(LogHandler):
 
     def __init__(self, *processors):
@@ -71,136 +51,133 @@ class PrintOutput(LogHandler):
             print(line, end='')
             sys.stdout.flush()
 
-class LogProcessor(LogHandler):
+class LogProcessor(Attributee):
 
-    @property
-    def data(self):
-        return {"type": "none"}
+    delimiter = String(default=":")
 
-class FileWriter(object):
-
-    def __call__(self, content):
+    def handler(self, writer) -> LogHandler:
         pass
 
-class WriterLogProcessor(LogHandler):
-
-    def __init__(self, writer=None) -> None:
-        super().__init__()
-        self._writer = writer
-
-    @property
-    def writer(self):
-        return self._writer
-
-    def _save(self):
-        if self.writer is not None:
-            self.writer(json.dumps(self.data))
-
     @property
     def data(self):
         return {"type": "none"}
 
-class MeasuresAggregator(Attributee, WriterLogProcessor):
+class ScoresExtractor(LogProcessor):
 
-    measure = Pattern(default="([a-zA-Z0-9_-]+) *: *(.*)")
+    def handler(self, writer):
+        from re import compile
+        data = {}
+        pattern = compile("([a-zA-Z0-9_-]+) *{} *(-?[0-9\.]+)".format(self.delimiter))
 
-    def __init__(self, *args, writer=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        WriterLogProcessor.__init__(self, writer)
-        self._data = {}
+        def callback(line: str):
+            if line is None:                
+                writer({"type": "aggregated", "data": data})
+                return
 
-    def __call__(self, line: str):
-        
-        if line is None:
-            self._save()
-            return
+            line = line.strip("\n")
 
-        line = line.strip("\n")
+            match = pattern.match(line)
 
-        match = self.measure.match(line)
+            if match is not None:
+                name = match.group(1)
+                value = match.group(2)
+                
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
 
-        if match is not None:
-            name = match.group(1)
-            value = match.group(2)
-            self._addmeasure(name, value)
+                data[name] = value
 
-    def _addmeasure(self, name, value):
-        try:
-            value = float(value)
-        except ValueError:
-            pass
+        return callback
 
-        self._data[name] = value
+class StepsExtractor(LogProcessor):
 
-    @property
-    def data(self):
-        return {"type": "aggregated", "data": self._data}
+    step = String(default="step")
 
-class IterativeMeasuresAggregator(Attributee, WriterLogProcessor):
+    def handler(self, writer):
+        from re import compile
+        _data = []
+        _state = {"offset": None, "step": None}
 
-    step = Pattern(default="step: *([0-9]+)")
-    measure = Pattern(default="([a-zA-Z0-9_-]+) *: *(.*)")
+        step_pattern = compile("{} *{} *([0-9]+)".format(self.step, self.delimiter))
+        value_pattern = compile("([a-zA-Z0-9_-]+) *{} *(-?[0-9\.]+)".format(self.delimiter))
 
-    def __init__(self, *args, writer=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        WriterLogProcessor.__init__(self, writer)
-        self._step = None
-        self._offset = None
-        self._data = []
+        def dostep(step = None):
 
-    def __call__(self, line: str):
-        
-        if line is None:
-            self._save()
-            return
+            if _state["step"] is None:
+                if step is None: step = 0
+                _state["step"] = step
+                _state["offset"] = step
+            else:
+                if not step is None and _state["step"] < step:
+                    _state["step"] = step
+            if len(_data) >= _state["step"] - _state["offset"] + 1:
+                return
 
-        line = line.strip("\n")
+            _data.extend([{}] * (_state["step"] - _state["offset"] + 1 - len(_data)))
+            writer({"type": "steps", "offset": _state["offset"], "data": _data})
 
-        match = self.step.match(line)
+        def callback(line: str):
+            if line is None:
+                writer({"type": "steps", "offset": _state["offset"], "data": _data})
+                return
 
-        if match is not None:
-            step = int(match.group(1))
-            self._makestep(step)
-            return
+            line = line.strip("\n")
 
-        match = self.measure.match(line)
+            match = step_pattern.match(line)
 
-        if match is not None:
-            name = match.group(1)
-            value = match.group(2)
-            self._makestep()
-            self._addmeasure(name, value)
+            if match is not None:
+                step = int(match.group(1))
+                dostep(step)
+                return
 
-    def _makestep(self, step=None):
-    
-        if self._step is None:
-            if step is None:
-                step = 0
+            match = value_pattern.match(line)
 
-            self._step = step
-            self._offset = step
-        else:
-            if not step is None and self._step < step:
-                self._step = step
+            if match is not None:
+                name = match.group(1)
+                value = match.group(2)
+                dostep()
+                
+                i = _state["step"] - _state["offset"]
 
-        if len(self._data) >= self._step - self._offset + 1:
-            return
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
 
-        self._data += [{}] * (self._step - self._offset + 1 - len(self._data))
+                _data[i][name] = value
 
-        self._save()
+        return callback
 
-    def _addmeasure(self, name, value):
-    
-        i = self._step - self._offset
+class SequencesExtractor(LogProcessor):
 
-        try:
-            value = float(value)
-        except ValueError:
-            pass
+    def handler(self, writer):
+        from re import compile
+        _data = {}
 
-        self._data[i][name] = value
+        pattern = compile("([a-zA-Z0-9_-]+) *{} *(-?[0-9\.]+)".format(self.delimiter))
 
-    @property
-    def data(self):
-        return {"type": "iterative", "offset": self._offset, "steps": self._data}
+        def callback(line: str):
+            if line is None:
+                writer({"type": "sequences", "data": _data})
+                return
+
+            line = line.strip("\n")
+
+            match = pattern.match(line)
+
+            if match is not None:
+                name = match.group(1)
+                value = match.group(2)
+                
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
+                if name not in _data:
+                    _data[name] = []
+                _data[name].append(value)
+
+        return callback
+

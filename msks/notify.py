@@ -1,26 +1,46 @@
 
-from typing import List, Callable
+import typing
+from typing import Callable
 
 import smtplib
 
+from attributee import Attributee, String, Integer, List
+
 from msks import logger
-from msks.task import Task, TaskStatus
-from msks.storage import TaskStorage
 
-class EMailNotifications:
 
-    def __init__(self, email, server, port, sender):
-        self._email = email
-        self._server = server
-        self._port= port
-        self._from = sender
+class Channel(Attributee):
+    def __call__(self, task: "msks.task.Task", event):
+        pass
 
-   # server = String(default="212.235.188.18")
-   # port = Integer(default=25)
-   # sender = String(default="hostmaster@vicos.si")
-   # recipient = String()
+class ConsoleChannel(Channel):
 
-    def __call__(self, task: Task, event):
+    filename = String()
+
+
+    def __call__(self, task: "Task", event):
+        from msks.task import TaskStatus
+
+        print("%s: %s" % (task.identifier, task.state))
+
+class FileChannel(Channel):
+
+    filename = String()
+
+    def __call__(self, task: "Task", event):
+        from msks.task import TaskStatus
+
+        pass
+
+class SMTPChannel(Channel):
+
+    server = String()
+    port = Integer()
+    sender = String()
+    recipients = List(String())
+
+    def __call__(self, task: "Task", event):
+        from msks.task import TaskStatus
 
         if event != "change" and task.status not in [TaskStatus.COMPLETE, TaskStatus.FAILED]:
             return
@@ -33,18 +53,20 @@ class EMailNotifications:
         message = "\n".join(lines[-100:] if len(lines) > 99 else lines)
 
         try:
-            with smtplib.SMTP(self._server, self._port) as server:
+            with smtplib.SMTP(self.server, self.port) as server:
                 message = ("Subject: {0}\r\n"
-                    "From: {1} \r\nTo: {2}\r\n\r\n{3}").format(title,
-                    self._from, self._email, message)
+                    "From: {1}\r\n\r\n{3}").format(title,
+                    self.sender, message)
 
-                server.sendmail(self._from, self._email, message.encode('utf-8'))
-                logger.info("Email send successfuly to %s", self._email)
+                server.sendmail(self.sender, self.recipients, message.encode('utf-8'))
+                logger.info("Email send successfuly to %s", self.recipients)
         except smtplib.SMTPException as e:
             logger.error("Unable to send email: %s", e)
 
 
-def watch(self, callbacks: List[Callable]):
+def watch(callbacks: typing.List[Callable]):
+
+    from msks.storage import TaskStorage
 
     tasks = TaskStorage()
 

@@ -6,8 +6,6 @@ import os
 import argparse
 from re import search
 
-from msks.config import get_config
-
 #from typing_extensions import runtime_checkable
 import argcomplete
 import logging
@@ -21,7 +19,7 @@ from rich.tree import Tree
 
 from msks import logger
 from msks.task import TaskFilter, TaskStatus
-from msks.storage import TaskQueue, TaskStorage
+from msks.storage import TaskQueue, get_tasks_store
 from msks.environment import Entrypoint, Environment
 
 console = Console()
@@ -67,6 +65,8 @@ def process_arguments(raw):
     return state
 
 def resolve_source(source):
+    from msks.config import get_config
+
     config = get_config()
 
     return config.aliases.get(source, source)
@@ -74,7 +74,7 @@ def resolve_source(source):
 
 def task_submit(source, entrypoint, arguments, properties=None, tags=None, force=False):
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
 
     r = tasks.create(resolve_source(source), entrypoint, arguments, exist_ok=force)
 
@@ -92,8 +92,8 @@ def task_submit(source, entrypoint, arguments, properties=None, tags=None, force
 
 def task_export(identifier, filename):
 
-    tasks = TaskStorage()
-    task = tasks.get(identifier, search=True)
+    tasks = get_tasks_store()
+    task = tasks.get(identifier)
 
     if task is None:
         raise RuntimeError("Task does not exist")
@@ -115,7 +115,7 @@ def task_export(identifier, filename):
 
 def task_script(source, entrypoint, arguments):
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
 
     command = tasks.export(resolve_source(source), entrypoint, arguments)
 
@@ -129,7 +129,7 @@ def do_shell(source):
 
 def task_execute(source, entrypoint, arguments, force=False, properties=None, tags=None, remove=False):
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
 
     r = tasks.create(resolve_source(source), entrypoint, arguments)
 
@@ -156,7 +156,7 @@ def do_queue(workers):
 
     from multiprocessing.pool import ThreadPool
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
     queue = TaskQueue(tasks)
 
     def worker():
@@ -196,7 +196,7 @@ def do_queue(workers):
     for worker in workers:
         worker.join()
 
-def _tasks_table(tasks):
+def _tasks_table(tasks, store: "TasksStore"):
 
     table = Table(title="Tasks", expand=True)
 
@@ -207,13 +207,13 @@ def _tasks_table(tasks):
     table.add_column("Updated", justify="right")
 
     for task in tasks:
-        table.add_row(task.identifier, task.status.color(), ", ".join(task.tags), str(task.created), str(task.updated))
+        table.add_row(task.identifier, task.status.color(), ", ".join(store.tags(task)), str(task.created), str(task.updated))
 
     return table
 
 def list_tasks(query):
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
 
     if query:
         logger.debug("Using query: %s", " ".join(query))
@@ -221,14 +221,14 @@ def list_tasks(query):
     else:
         query = None
 
-    table = _tasks_table(tasks.query(query))
+    table = _tasks_table(tasks.query(query), tasks)
 
     console.print(table)
 
 def task_tag(identifier, tag):
 
-    tasks = TaskStorage()
-    task = tasks.get(identifier, search=True)
+    tasks = get_tasks_store()
+    task = tasks.get(identifier)
 
     if task is None:
         raise RuntimeError("Task does not exist")
@@ -237,8 +237,8 @@ def task_tag(identifier, tag):
 
 def task_info(identifier, recursive=False):
 
-    tasks = TaskStorage()
-    task = tasks.get(identifier, search=True)
+    tasks = get_tasks_store()
+    task = tasks.get(identifier)
 
     if task is None:
         raise RuntimeError("Task does not exist")
@@ -320,8 +320,8 @@ def task_entrypoints(source):
 
 def task_log(identifier):
 
-    tasks = TaskStorage()
-    task = tasks.get(identifier, search=True)
+    tasks = get_tasks_store()
+    task = tasks.get(identifier)
 
     if task is None:
         logger.error("Task does not exist")
@@ -331,7 +331,7 @@ def task_log(identifier):
 
 def task_remove(query, force=False, yes=False):
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
 
     query = TaskFilter(" ".join(query))
 
@@ -342,7 +342,7 @@ def task_remove(query, force=False, yes=False):
         return
 
     if not yes:
-        console.print(_tasks_table(selected))
+        console.print(_tasks_table(selected, tasks))
         if not query_yes_no("Remove these tasks?", "no"):
             return
 
@@ -356,7 +356,7 @@ def task_remove(query, force=False, yes=False):
 
 def do_cleanup(yes=False):
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
 
     environments = Environment.list_environments()
     sources = Environment.list_sources()
@@ -385,7 +385,7 @@ def do_cleanup(yes=False):
 
 def task_reset(query, force=False, remove=False, yes=False):
 
-    tasks = TaskStorage()
+    tasks = get_tasks_store()
 
     query = TaskFilter(" ".join(query))
 
@@ -396,7 +396,7 @@ def task_reset(query, force=False, remove=False, yes=False):
         return
 
     if not yes:
-        console.print(_tasks_table(selected))
+        console.print(_tasks_table(selected, tasks))
         if not query_yes_no("Reset these tasks?", "no"):
             return
 
@@ -420,14 +420,7 @@ def main():
     queue_parser = subparsers.add_parser('queue', help='Start a processing queue that executes available tasks')
     queue_parser.add_argument("--workers", default=1, required=False, help='Number of tasks executed in parallel', type=int)
 
-    server_parser = subparsers.add_parser('server', help='HTTP API server')
-    server_parser.add_argument("--port", default=25, help='SMTP server port', type=int)
-
     notify_parser = subparsers.add_parser('notify', help='Watches results storage and notifies on status change')
-    notify_parser.add_argument("--email", required=True, help='Email of the recipient', type=str)
-    notify_parser.add_argument("--server", default="localhost", help='SMTP server address', type=str)
-    notify_parser.add_argument("--port", default=25, help='SMTP server port', type=int)
-    notify_parser.add_argument("--from", default="meeseek@example.net", help='Sender email', type=str)
 
     run_parser = subparsers.add_parser('run', help='Execute a task')
     run_parser.add_argument("--tag", "-t", action='append', help='Tag task with human readable name', type=str)
@@ -483,8 +476,11 @@ def main():
     submit_parser.add_argument('entrypoint', help='Entrypoint that you want to execute')
     submit_parser.add_argument('arguments', nargs=argparse.REMAINDER, help='Arguments for the entrypoint')
 
-    entrypoints_parser = subparsers.add_parser('entrypoints', help='Describes entrypoints for source repository')
+    entrypoints_parser = subparsers.add_parser('entrypoints', help='Describes entrypoints for given source')
     entrypoints_parser.add_argument("source", help='Source repository to use')
+
+    validate_parser = subparsers.add_parser('validate', help='Validates entrypoints file')
+    validate_parser.add_argument("source", help='Entrypoints file to validate')
 
     cleanup_parser = subparsers.add_parser('cleanup', help='Removes environments and sources that are no longer attached to any task')
     cleanup_parser.add_argument("--yes", "-y", default=False, help="Do not require confirmation", required=False, action='store_true')
@@ -527,12 +523,30 @@ def main():
             task_export(args.identifier, args.filename)
         elif args.action == "entrypoints":
             task_entrypoints(args.source)
+        elif args.action == "validate":
+            from msks.environment import Entrypoints
+            try:
+                config = Entrypoints.read(args.source)
+                config.dump()
+                print("Valid entrypoint file")
+            except AttributeError as ae:
+                print("Invalid syntax: {}".format(ae))
+
         elif args.action == "cleanup":
             do_cleanup(yes=args.yes)
         elif args.action == "queue":
             do_queue(args.workers)
+
+
         elif args.action == "notify":
-            pass
+            from msks.config import get_config
+
+            channels = get_config().notify
+            if len(channels) == 0:
+                raise RuntimeError("No notification channels configured")
+            from .notify import watch
+            watch(channels)
+
         else:
             parser.print_help()
 

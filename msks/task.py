@@ -1,25 +1,31 @@
 
 
 import os
-import logging
 import json
-import re
 import shutil
-from time import time, sleep
-from threading import Condition
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional, Callable, List
 
 import filelock
-from msks.log import FileOutput, FileWriter, IterativeMeasuresAggregator, MeasuresAggregator, Multiplexer, PrintOutput
+from msks.log import Multiplexer, PrintOutput, LogHandler
 from watchgod import AllWatcher
 
-from msks import dict_hash, logger
+from msks import logger
 from msks.environment import Environment, Entrypoint
 
 _META_DIRECTORY = ".meta"
 
+class StoreOutput(LogHandler):
+
+    def __init__(self, store):
+        self._store = store
+
+    def __call__(self, line):
+        self._store.append_log(line)
+
+    def contents(self):
+        return self._store.log()
 
 class TaskWatcher(AllWatcher):
 
@@ -70,21 +76,21 @@ class TaskStatus(Enum):
 
 class Task(object):
 
-    def __init__(self, storage: "TaskStorage", identifier):
-        self._storage = storage
-        self._root = os.path.join(storage.root, identifier)
+    def __init__(self, store: "TaskStore", identifier: str):
+        self._store = store
         self._identifier = identifier
-        self._lock = filelock.FileLock(os.path.join(self._root, _META_DIRECTORY, ".lock"))
-        self._runlock = filelock.FileLock(os.path.join(self._root, _META_DIRECTORY, ".runlock"))
-        self._meta = None
         self._env = None
         self._entrypoint = None
 
+    def _rundir(self):
+        from msks.config import get_config
+        return os.path.join(get_config().runtime, self.identifier)
+
     def run(self, force=False, dependencies=[], output=True):
 
-        with self._lock:
-            self.update()
+        rundir = self._rundir()
 
+        with self._store:
             if self.status == TaskStatus.COMPLETE and not force:
                 logger.info("Task already done, aborting.")
                 return True
@@ -107,107 +113,87 @@ class Task(object):
                     raise RuntimeError("Dependent task not complete: {}".format(did))
                 for file in files:
                     source_file = dependencies[did].filepath(file)
-                    dest_file = os.path.join(self._root, did + "_" + file)
+                    dest_file = os.path.join(rundir, did + "_" + file)
                     if not os.path.exists(source_file):
                         self._status(TaskStatus.FAILED)
                         raise RuntimeError("File not found in dependency {}: {}".format(did, source_file))
                     if os.path.exists(dest_file):
                         os.unlink(dest_file)
                     logger.debug("Linking dependency %s to %s", source_file, dest_file)
+                    # TODO: add readonly flag?
                     os.symlink(source_file, dest_file)
 
             self._status(TaskStatus.PREPARING)
 
-        env = Environment(self._meta["repository"] + "@" + self._meta["commit"])
+        env = Environment(self.source)
         if not env.setup():
             self._status(TaskStatus.FAILED)
             return False
 
-        command = self._meta["command"]
+        command = self._store.get("#command")
 
         logger.info("Running task: %s", " ".join(command))
         self._status(TaskStatus.RUNNING)
 
-        class DataWriter(FileWriter):
-
-            def __init__(self, task: Task, filename) -> None:
-                self._task = task
-                self._filename = filename
+        class DataWriter(object):
+            def __init__(self, store: "TaskStore", key: str) -> None:
+                self._store = store
+                self._key = key
 
             def __call__(self, content):
-                with self._task._lock:
-                    with open(self._filename, "w") as handle:
-                        handle.write(content)
+                self._store.set(self._key, content)
 
-        with self._runlock:
-            logs = [FileOutput(os.path.join(self._root, _META_DIRECTORY, "output.txt"))]
+        os.makedirs(rundir, exist_ok=True)
+
+        runlock = filelock.FileLock(os.path.join(rundir, ".runlock"))
+
+        with runlock:
+            logs = [StoreOutput(self._store)]
 
             if output:
                 logs.append(PrintOutput())
 
-            if self.entrypoint.observers.iterations is not None:
-                writer = DataWriter(self, os.path.join(self._root, _META_DIRECTORY, "data_iterative.json"))
-                logs.append(IterativeMeasuresAggregator(writer=writer, **self.entrypoint.observers.iterations.dump()))
+            for i, observer in enumerate(self.entrypoint.observers):
+                writer = DataWriter(self._store, "observer_%d" % i)
+                logs.append(observer.handler(writer))
 
-            if self.entrypoint.observers.aggregate is not None:
-                writer = DataWriter(self, os.path.join(self._root, _META_DIRECTORY, "data_aggregated.json"))
-                logs.append(MeasuresAggregator(writer=writer, **self.entrypoint.observers.aggregate.dump()))
-
-            if env.run(*command, cwd=self._root,
+            if env.run(*command, cwd=rundir,
                 env=self.entrypoint.environment, 
                 output=Multiplexer(*logs)):
 
+                artifacts = []
+                for entry in os.scandir(rundir):
+                    if entry.is_file:
+                        for pattern in self.entrypoint.artifacts:
+                            filename = os.path.basename(entry.path)
+                            if pattern(filename):
+                                artifacts.append(filename)
+                                continue
+                        
+                for artifact in artifacts:
+                    logger.debug("Saving artifact %s", artifact)
+
+                    with open(os.path.join(rundir, artifact), "rb") as source:
+                        with self._store.write(artifact, binary=True) as dest:
+                            shutil.copyfileobj(source, dest)
+
                 self._status(TaskStatus.COMPLETE)
+
+                shutil.rmtree(rundir, ignore_errors=True)
+
                 return True
             else:
                 self._status(TaskStatus.FAILED)
                 return False
 
-    def update(self):
-        with self._lock:
-            metafile = os.path.join(self._root, _META_DIRECTORY, "meta.json")
-            with open(metafile, "r") as handle:
-                self._meta = json.load(handle)
-
-    def restore(self):
-        with self._lock:
-            if self._meta is None:
-                self.update()
-            if self.status == TaskStatus.RUNNING:
-                if not os.path.exists(self._runlock.lock_file):
-                    self._status(TaskStatus.FAILED)
-                else:
-                    try:
-                        self._runlock.acquire(0.1)
-                        self._update(TaskStatus.PENDING)
-                        self._runlock.release()
-                    except filelock.Timeout:
-                        pass
-
     def _status(self, status: TaskStatus):
         assert isinstance(status, TaskStatus)
-        self._meta["status"] = str(status)
-        self._meta["updated"] = str(datetime.utcnow())
-        self._push()
-
-    def _push(self):
-        with self._lock:
-            metafile = os.path.join(self._root, _META_DIRECTORY, "meta.json")
-            self._timestamp = os.stat(metafile).st_ctime
-            with open(metafile, "w") as handle:
-                json.dump(self._meta, handle)
+        self._store.set("#status", str(status))
 
     def reset(self, clear=False):
-        with self._lock:
+        with self._store:
             if clear:
-                for entry in os.scandir(self._root):
-                    if entry.name == _META_DIRECTORY:
-                        continue
-                    if entry.is_dir:
-                        shutil.rmtree(entry.path, ignore_errors=True)
-                    else:
-                        os.unlink(entry.path)
-
+                self._store.clear()
             self._status(TaskStatus.PENDING)
 
     @property
@@ -216,33 +202,26 @@ class Task(object):
 
     @property
     def dependencies(self):
-        if self._meta is None:
-            self.update()
-        return self._meta.get("dependencies", {})
+        deps = self._store.get("#dependencies")
+        return deps if deps is not None else {}
 
     @property
     def status(self):
-        if self._meta is None:
-            self.update()
-        return TaskStatus(self._meta.get("status", "unknown"))
+        status = self._store.get("#status")
+        return TaskStatus(status if status is not None else "unknown")
 
     @property
     def created(self) -> datetime:
-        if self._meta is None:
-            self.update()
-        datestr = self._meta.get("created", None)
+        datestr = self._store.get("#created")
         if datestr is None:
             return None
         return datetime.strptime(datestr, '%Y-%m-%d %H:%M:%S.%f').astimezone()
 
     @property
     def updated(self) -> datetime:
-        if self._meta is None:
-            self.update()
-        datestr = self._meta.get("updated", None) 
+        datestr = self._store.get("#updated")
         if datestr is None:
             return None
-            
         return datetime.strptime(datestr, '%Y-%m-%d %H:%M:%S.%f').astimezone()
 
     @property
@@ -253,110 +232,82 @@ class Task(object):
 
     @property
     def entrypoint_name(self) -> str:
-        if self._meta is None:
-            self.update()
-        return self._meta.get("entrypoint", None) 
+        return self._store.get("#entrypoint")
 
     @property
     def entrypoint(self) -> Entrypoint:
-        with self._lock:
+        with self._store:
             if self._entrypoint is not None:
                 return self._entrypoint
-            cachefile = os.path.join(self._root, _META_DIRECTORY, "entrypoint.yaml")
-            if os.path.isfile(cachefile):
-                self._entrypoint = Entrypoint.read(cachefile)
+            cache = self._store.get("entrypoint")
+            if cache is not None :
+                self._entrypoint = Entrypoint(**cache)
                 return self._entrypoint
             else:
                 self._entrypoint = self.environment.entrypoints[self.entrypoint_name]
-                self._entrypoint.write(cachefile)
+                self._store.set("entrypoint", self._entrypoint.dump())
                 return self._entrypoint
 
     @property
     def arguments(self):
-        if self._meta is None:
-            self.update()
-        return self._meta.get("arguments", {}) 
+        args = self._store.get("#arguments")
+        return self.entrypoint.coerce(args) if args is not None else {}
 
     def argument(self, name):
-        if self._meta is None:
-            self.update()
-        args = self._meta.get("arguments", {}) 
-        args = self.entrypoint.merge(args, True)
+        args = self.entrypoint.merge(self.arguments, True)
         return args.get(name, None)
-
-
-    def data(self, name):
-        if self._meta is None:
-            self.update()
-        datafile = os.path.join(self._root, _META_DIRECTORY, "data_%s.json" % name)
-        if os.path.isfile(datafile):
-            with open(datafile, "r") as handle:
-                return json.load(handle)
-        return None
-
 
     @property
     def log(self):
-        if self._meta is None:
-            self.update()
-        logfile = os.path.join(self._root, _META_DIRECTORY, "output.txt")
-        if os.path.exists(logfile):
-            return open(logfile).read()
-        return ""
+        return self._store.log()
 
     @property
     def source(self):
-        if self._meta is None:
-            self.update()
-        return self._meta["repository"] + "@" + self._meta["commit"]
+        repository = self._store.get("#repository")
+        commit = self._store.get("#commit")
+        return repository + "#" + commit
+
+    @property
+    def repository(self):
+        return self._store.get("#repository")
+
+    @property
+    def commit(self):
+        return self._store.get("#commit")
 
     @property
     def tags(self):
-        return self._storage.tags(self)
+        # TODO: how to do this?
+        return [] #self._storage.tags(self)
 
     def filepath(self, file: str):
-        if os.path.isabs(file):
-            raise IOError("Only relative paths allowed")
-
-        return os.path.join(self._root, file)
-
-    def read(self, file, binary=False):
-        full = self.filepath(file)
-
-        if binary:
-            return open(full, mode="rb")
-        else:
-            return open(full, mode="r", newline="")
+        return self._store.filepath(file)
 
     def get(self, key: str, default: Optional[Any] = None):
-        if self._meta is None:
-            self.update()
-        if not "properties" in self._meta:
+        properties = self._store.get("#properties")
+        if properties is None:
             return default
-        if not key in self._meta["properties"]:
+        if not key in properties:
             return default
-        return self._meta["properties"][key]
+        return properties[key]
 
     @property
     def properties(self):
-        if self._meta is None:
-            self.update()
-        if not "properties" in self._meta:
+        properties = self._store.get("#properties")
+        if properties is None:
             return dict()
-        return dict(**self._meta["properties"])
+        return dict(**properties)
 
     def set(self, key: str, value: Any):
         with self._lock:
-            self.update()
-            
-            if not "properties" in self._meta:
-                self._meta["properties"] = {}
-            if key in self._meta["properties"]:
-                if self._meta["properties"][key] == value:
+            properties = self._store.get("#properties")
+            if properties is None:
+                properties = {}
+            if key in properties:
+                if properties[key] == value:
                     return False
-            self._meta["properties"][key] = value
-            self._meta["updated"] = str(datetime.now())
-            self._push()
+            self._store.set("#properties", properties)
+            return True
 
 _filter_claims = {
     "failed": lambda x: x.status == TaskStatus.FAILED,
@@ -364,6 +315,8 @@ _filter_claims = {
     "complete": lambda x: x.status == TaskStatus.COMPLETE,
     "running": lambda x: x.status == TaskStatus.RUNNING,
     "entrypoint": lambda x: x.entrypoint_name,
+    "source": lambda x: x.source,
+    "commit": lambda x: x.commit,
     "created": lambda x: x.created,
     "updated": lambda x: x.updated
 }

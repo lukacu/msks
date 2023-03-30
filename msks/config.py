@@ -2,21 +2,30 @@
 import os
 from pathlib import Path
 
-from attributee import Attributee, String, Map, Nested
+from attributee import Attributee, String, Map, Nested, Object, List, URL
 from attributee.io import Serializable
 
 _default_root = os.path.join(os.environ["HOME"], ".local", "msks")
-class Registry(Attributee):
-    url = String(default=os.environ.get("MSKS_REGISTRY", None), readonly=True)
-    key = String(default=None)
-    
+
+
 class Configuration(Attributee, Serializable):
 
-    registry = Nested(Registry)
-    conda = String(default=os.environ.get("MSKS_CONDA_DIR", os.path.join(_default_root, "conda")), readonly=True)
-    sources = String(default=os.environ.get("MSKS_SOURCES_DIR", os.path.join(_default_root, "sources")), readonly=True)
-    tasks = String(default=os.environ.get("MSKS_TASKS_DIR", os.path.join(_default_root, "tasks")), readonly=True)
+    store = URL(default="file://" + os.path.join(_default_root, "tasks"))
+    cache = String(default=os.environ.get("MSKS_CACHE_DIR", os.path.join(_default_root, "cache")), readonly=True)
     aliases = Map(String(), default={})
+    notify = List(Object(subclass="msks.notify.Channel"), default={})
+
+    @property
+    def conda(self):
+        return os.path.join(self.cache, "conda")
+
+    @property
+    def sources(self):
+        return os.path.join(self.cache, "sources")
+
+    @property
+    def runtime(self):
+        return os.path.join(self.cache, "runtime")
 
 _HOME = str(Path.home())
 _CONFIG = None

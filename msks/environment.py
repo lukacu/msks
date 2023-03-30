@@ -10,7 +10,7 @@ import shutil
 import re
 import shlex
 from attributee.primitives import Boolean, Primitive
-from msks.log import FileOutput, IterativeMeasuresAggregator, MeasuresAggregator, Multiplexer, PrintOutput
+from msks.log import FileOutput, Multiplexer, PrintOutput
 
 import yaml
 
@@ -28,7 +28,7 @@ from msks.config import get_config
 
 ARGUMENT_PARSER = re.compile(r"\{\{(:?[a-zA-Z0-9_]+)\}\}")
 
-CONDA_URL = "https://repo.anaconda.com/miniconda/Miniconda3-py39_4.12.0-Linux-x86_64.sh"
+CONDA_URL = "https://repo.anaconda.com/miniconda/Miniconda3-py37_23.1.0-1-Linux-x86_64.sh"
 
 def _lock_conda():
     conda_dir = get_config().conda
@@ -65,12 +65,20 @@ def _find_file(directory, options):
             return filepath
     return None
 
-def logger_resolver(typename: str, _, **kwargs) -> Attributee:
+def processor_resolver(typename: str, ctx, **kwargs) -> Attributee:
+    from msks.log import StepsExtractor, ScoresExtractor, SequencesExtractor
+    from attributee.object import default_object_resolver
 
-    if typename == "iterative":
-        return IterativeMeasuresAggregator
+    if typename == "steps":
+        return StepsExtractor(**kwargs)
 
-    return None
+    if typename == "sequences" or typename == "iterative":
+        return SequencesExtractor(**kwargs)
+
+    if typename == "scores":
+        return ScoresExtractor(**kwargs)
+
+    return default_object_resolver(typename, ctx, **kwargs)
 
 class ArgumentType(Enum):
 
@@ -78,10 +86,6 @@ class ArgumentType(Enum):
     FLOAT = "float"
     BOOL = "bool"
     STRING = "string"
-
-class ObserverConfig(Attributee):
-    iterations = Nested(IterativeMeasuresAggregator, default=None)
-    aggregate = Nested(MeasuresAggregator, default=None)
 
 class Argument(Attributee):
 
@@ -101,11 +105,31 @@ class Argument(Attributee):
             return to_logical(value)
         return str(value)
 
+class FileMatch(String):
+
+    class Matcher(object):
+
+        def __init__(self, pattern):
+            self._pattern = pattern
+
+        def __call__(self, filename):
+            from fnmatch import fnmatch
+            return fnmatch(filename, self._pattern)
+
+    def coerce(self, value, ctx):
+        value = super().coerce(value, ctx)
+        return FileMatch.Matcher(value)
+
+    def dump(self, value):
+        return value._pattern
+
+
 class Entrypoint(Attributee, Serializable):
     command = String()
-    observers = Nested(ObserverConfig)
+    observers = List(Object(resolver=processor_resolver, subclass="msks.log.LogProcessor"), default=[])
     arguments = Map(Nested(Argument), default={})
     environment = Map(String(), default={})
+    artifacts = List(FileMatch(), separator=";", default=[])
 
     def generate(self, arguments):
         arg = self.merge(arguments, True)
@@ -117,6 +141,10 @@ class Entrypoint(Attributee, Serializable):
                 raise ValueError("Argument {} not defined", match.group(1))
 
         return shlex.split(ARGUMENT_PARSER.sub(replace, self.command))
+
+    def coerce(self, arguments):
+        return {k: self.arguments[k].coerce(v) for k, v in arguments.items() 
+                if k in self.arguments}
 
     def merge(self, arguments, insignificant=False):
         arg = dict([(k, v.coerce(v.default)) for k, v in self.arguments.items() if insignificant or v.significant])
@@ -137,11 +165,11 @@ class Environment(object):
 
     def __init__(self, source):
 
-        if not "@" in source:
+        if not "#" in source:
             repository = source
             commit = "master"
         else:
-            repository, commit = source.split("@")
+            repository, commit = source.split("#")
 
         remote_heads = git.cmd.Git().ls_remote(repository, heads=True)
         remote_heads = [head.split("\t") for head in remote_heads.split("\n")]
